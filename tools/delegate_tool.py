@@ -661,6 +661,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    parent_system_prompt: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -669,12 +670,33 @@ def _build_child_system_prompt(
     inspiration/openclaw/src/agents/subagent-system-prompt.ts:63-95).
     The depth note is literal truth (grounded in the passed config) so
     the LLM doesn't confabulate nesting capabilities that don't exist.
+
+    When parent_system_prompt is provided, it is prepended to the child's
+    prompt so the child's first API call hits the parent's prompt cache
+    (Claude Code's runForkedAgent / createCacheSafeParams pattern).
+    The parent prompt is frozen — never modified — so the cache prefix
+    matches exactly.
     """
-    parts = [
+    parts = []
+
+    # ── Cache inheritance: prepend parent's system prompt ─────────────
+    # This is the forked-agent cache-sharing pattern from Claude Code.
+    # The parent's rendered system prompt (tools, skills, memory, personality)
+    # is frozen and prepended verbatim. The child's task-specific prompt
+    # follows as a small suffix. The API sees:
+    #   [parent system prompt — CACHED] + [child task prompt — fresh]
+    # Cache hits on the parent prefix save ~90% of system-prompt input cost.
+    if parent_system_prompt and parent_system_prompt.strip():
+        parts.append(parent_system_prompt.rstrip())
+        parts.append("")
+        parts.append("---")
+        parts.append("")
+
+    parts.extend([
         "You are a focused subagent working on a specific delegated task.",
         "",
         f"YOUR TASK:\n{goal}",
-    ]
+    ])
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
     if workspace_path and str(workspace_path).strip():
@@ -754,6 +776,131 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
         if os.path.isabs(text) and os.path.isdir(text):
             return text
     return None
+
+
+def _create_worktree(parent_cwd: str, task_id: str) -> Optional[str]:
+    """Create a git worktree for subagent isolation.
+
+    Returns the absolute path to the new worktree, or None on failure.
+    The worktree is created at ``.hermes/worktrees/{task_id}/`` inside
+    the parent repo. Recursive guard: worktree children cannot create
+    their own worktrees (checked by caller via ``_is_in_worktree``).
+    """
+    import subprocess
+
+    # Resolve config
+    cfg = _load_config()
+    wt_dir = cfg.get("worktree_dir", ".hermes/worktrees/")
+    wt_auto_cleanup = cfg.get("worktree_auto_cleanup", True)
+
+    # Expand and resolve the worktree directory relative to parent cwd
+    wt_base = os.path.join(parent_cwd, wt_dir)
+    wt_base = os.path.abspath(os.path.expanduser(wt_base))
+    wt_path = os.path.join(wt_base, task_id)
+
+    try:
+        # Ensure base directory exists
+        os.makedirs(wt_base, exist_ok=True)
+
+        # Check if parent is a git repo
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, cwd=parent_cwd, timeout=10,
+        )
+        if result.returncode != 0:
+            logger.debug("Worktree: parent cwd is not a git repo, skipping isolation")
+            return None
+
+        # Check if we're already inside a worktree (recursive guard)
+        result_wt = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, cwd=parent_cwd, timeout=10,
+        )
+        # Check git common dir — worktrees have a different git dir
+        result_common = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, cwd=parent_cwd, timeout=10,
+        )
+        git_dir = result_common.stdout.strip()
+        # If git dir is not ".git" (relative), we're likely already in a worktree
+        if git_dir and not git_dir.endswith(".git") and "/.git/worktrees/" in git_dir:
+            logger.debug("Worktree: already inside a worktree (%s), recursive guard — skipping", git_dir)
+            return None
+
+        # Create the worktree
+        result = subprocess.run(
+            ["git", "worktree", "add", "--detach", wt_path, "HEAD"],
+            capture_output=True, text=True, cwd=parent_cwd, timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warning("Worktree creation failed: %s", result.stderr.strip())
+            return None
+
+        logger.info("Worktree created at %s", wt_path)
+        return wt_path
+
+    except Exception as exc:
+        logger.debug("Worktree creation error: %s", exc)
+        return None
+
+
+def _cleanup_worktree(wt_path: str) -> None:
+    """Remove a git worktree after the subagent finishes.
+
+    Only removes if the worktree has no uncommitted changes (safe cleanup).
+    If there are changes, keeps the worktree for manual review.
+    """
+    import subprocess
+
+    if not wt_path or not os.path.isdir(wt_path):
+        return
+
+    cfg = _load_config()
+    auto_cleanup = cfg.get("worktree_auto_cleanup", True)
+    if not auto_cleanup:
+        logger.info("Worktree auto-cleanup disabled, keeping %s", wt_path)
+        return
+
+    try:
+        # Check for uncommitted changes
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, cwd=wt_path, timeout=10,
+        )
+        has_changes = bool(result.stdout.strip())
+
+        if has_changes:
+            logger.info(
+                "Worktree %s has uncommitted changes — keeping for review", wt_path
+            )
+            return
+
+        # Find the parent repo to remove the worktree from
+        result_common = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, cwd=wt_path, timeout=10,
+        )
+        common_dir = result_common.stdout.strip()
+        # The common dir points to the main repo's .git
+        main_repo = os.path.dirname(os.path.dirname(common_dir)) if common_dir else None
+
+        if main_repo and os.path.isdir(main_repo):
+            result = subprocess.run(
+                ["git", "worktree", "remove", "--force", wt_path],
+                capture_output=True, text=True, cwd=main_repo, timeout=15,
+            )
+            if result.returncode == 0:
+                logger.info("Worktree cleaned up: %s", wt_path)
+            else:
+                logger.debug("Worktree remove failed: %s", result.stderr.strip())
+        else:
+            # Fallback: just remove the directory
+            import shutil
+            shutil.rmtree(wt_path, ignore_errors=True)
+            logger.info("Worktree directory removed: %s", wt_path)
+
+    except Exception as exc:
+        logger.debug("Worktree cleanup error: %s", exc)
 
 
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
@@ -990,6 +1137,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    isolation: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1070,6 +1218,29 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
+
+    # ── Worktree isolation ────────────────────────────────────────────
+    # When isolation="worktree", create a git worktree and override the
+    # workspace hint so the child agent operates in an isolated copy of
+    # the repo. Recursive guard: _create_worktree checks if we're already
+    # inside a worktree and returns None.
+    child_worktree_path = None
+    if isolation == "worktree" and workspace_hint:
+        child_worktree_path = _create_worktree(workspace_hint, subagent_id)
+        if child_worktree_path:
+            workspace_hint = child_worktree_path  # Override cwd for child
+    # Read from _cached_system_prompt (set by conversation_loop during
+    # _restore_or_build_system_prompt). Fall back to ephemeral_system_prompt
+    # if the parent itself is a subagent. Controlled by config:
+    #   delegation.cache_inheritance: true (default: false — opt-in)
+    parent_sys_prompt = None
+    cfg = _load_config()
+    if cfg.get("cache_inheritance", False):
+        parent_sys_prompt = (
+            getattr(parent_agent, "_cached_system_prompt", None)
+            or getattr(parent_agent, "ephemeral_system_prompt", None)
+        )
+
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -1077,6 +1248,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        parent_system_prompt=parent_sys_prompt,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1254,6 +1426,9 @@ def _build_child_agent(
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    # Store worktree path for cleanup after child finishes
+    if child_worktree_path:
+        child._worktree_path = child_worktree_path
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
     # → NULL). Mirrors /branch's ``_branched_from`` pattern — see
@@ -2038,6 +2213,16 @@ def _run_single_child(
         except Exception:
             logger.debug("Failed to close child agent after delegation")
 
+        # ── Worktree cleanup ──────────────────────────────────────────
+        # Remove the git worktree after the child finishes. If the child
+        # made uncommitted changes, the worktree is kept for manual review.
+        try:
+            wt_path = getattr(child, "_worktree_path", None)
+            if wt_path:
+                _cleanup_worktree(wt_path)
+        except Exception:
+            logger.debug("Failed to cleanup worktree after delegation")
+
 
 def _recover_tasks_from_json_string(
     tasks: Any,
@@ -2072,6 +2257,7 @@ def delegate_task(
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    isolation: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2085,6 +2271,17 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    The 'isolation' parameter controls filesystem isolation:
+      - None (default): child shares parent's working directory
+      - "worktree": child gets a git worktree copy of the repo at
+        .hermes/worktrees/{subagent_id}/. Auto-cleaned after child
+        finishes unless it has uncommitted changes. Recursive guard:
+        worktree children cannot create their own worktrees.
+
+    The 'background' parameter controls execution mode:
+      - False (default): blocks until child completes
+      - True: returns immediately, child runs on daemon executor
 
     Returns JSON with results array, one entry per task.
     """
@@ -2242,6 +2439,7 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
+                isolation=isolation,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
