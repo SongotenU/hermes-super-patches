@@ -8578,6 +8578,127 @@ def _discard_lockfile_churn(git_cmd, repo_root):
         pass
 
 
+def _post_update_merge_patches(git_cmd: list, project_root) -> None:
+    """Auto-merge local 'my-patches' branch after a successful update.
+
+    Runs at the end of ``_cmd_update_impl`` to prevent local patches from
+    being stranded on 'main'. Flow:
+      1. Check if 'my-patches' branch exists locally.
+      2. If yes, switch to it and merge the freshly-pulled main.
+      3. On conflict, auto-resolve using 'ours' (patches take priority).
+      4. Reinstall the package from the patched branch.
+      5. Run the verification script if present.
+    All failures are non-fatal — the core update already succeeded.
+    """
+    try:
+        # Check if my-patches branch exists
+        check = subprocess.run(
+            git_cmd + ["rev-parse", "--verify", "my-patches"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+        )
+        if check.returncode != 0:
+            return  # No my-patches branch — nothing to do
+
+        current = subprocess.run(
+            git_cmd + ["branch", "--show-current"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        print()
+        print("── Post-update: merging local patches ──────────────────────")
+
+        # Switch to my-patches if not already on it
+        if current != "my-patches":
+            print("→ Switching to my-patches...")
+            subprocess.run(
+                git_cmd + ["checkout", "my-patches"],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        # Merge main into my-patches
+        print("→ Merging main into my-patches...")
+        merge = subprocess.run(
+            git_cmd + ["merge", "main", "-m",
+                       "Merge branch 'main' into my-patches (auto post-update)"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+        )
+
+        if merge.returncode != 0:
+            # Conflicts — auto-resolve using ours (patches priority)
+            print("⚠️  Merge conflict — auto-resolving (patches priority)...")
+            status = subprocess.run(
+                git_cmd + ["diff", "--name-only", "--diff-filter=U"],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+            )
+            conflicted = status.stdout.strip().splitlines() if status.stdout.strip() else []
+            for f in conflicted:
+                print(f"   keeping patches for: {f}")
+                subprocess.run(
+                    git_cmd + ["checkout", "--ours", f],
+                    cwd=project_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                subprocess.run(
+                    git_cmd + ["add", f],
+                    cwd=project_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            subprocess.run(
+                git_cmd + ["commit", "-m",
+                           "Merge main (auto-resolved conflicts — ours)"],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            print("✓ Conflicts resolved")
+
+        # Reinstall from patched branch
+        print("→ Reinstalling from my-patches...")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--ignore-installed",
+             "--no-deps", "-e", "."],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        # Run verification script if present
+        verify_path = os.path.expanduser(
+            "~/.hermes/skills/devops/hermes-update-protection/"
+            "references/verify-post-update.py"
+        )
+        if os.path.exists(verify_path):
+            print("→ Running verification...")
+            subprocess.run(
+                [sys.executable, verify_path],
+                cwd=project_root,
+                check=False,
+            )
+
+        print("✓ Patches merged & verified")
+    except Exception as exc:
+        # Non-fatal — the core update already succeeded
+        logger.debug("Post-update patch merge failed: %s", exc)
+        print(f"  ℹ Post-update merge skipped: {exc}")
+
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version.
 
@@ -8954,6 +9075,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     check=False,
                 )
             print("✓ Already up to date!")
+            _post_update_merge_patches(git_cmd, PROJECT_ROOT)
             _resume_windows_gateways_after_update(_windows_gateway_resume)
             return
 
@@ -9460,6 +9582,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         print()
         print("✓ Update complete!")
+
+        # ── Post-update: auto-merge local patches branch ──────────────
+        # If a 'my-patches' branch exists, switch to it, merge the freshly
+        # pulled main, auto-resolve conflicts (ours = patches), reinstall,
+        # and run the verification script. This prevents local patches from
+        # being stranded on 'main' after every `hermes update`.
+        _post_update_merge_patches(git_cmd, PROJECT_ROOT)
 
         # Curator first-run heads-up. Only prints when curator is enabled AND
         # has never run — i.e. the window where the ticker would otherwise
