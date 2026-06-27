@@ -54,6 +54,20 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "vision_analyze",
     "web_extract",
     "web_search",
+    # ── Claude Code-inspired additions (concurrency.py) ──────────────────
+    "browser_snapshot",
+    "browser_get_images",
+    "browser_vision",
+    "browser_console",
+    "kanban_show",
+    "kanban_list",
+    "spotify_search",
+    "spotify_playlists",
+    "spotify_albums",
+    "spotify_library",
+    "spotify_devices",
+    "tool_search",
+    "tool_describe",
 })
 
 # File tools can run concurrently when they target independent paths.
