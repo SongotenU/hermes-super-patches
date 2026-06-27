@@ -32,6 +32,32 @@ from typing import Dict, Any, List, Optional, Tuple
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
 
+# ── Claude Code-inspired enhancements ──────────────────────────────────
+# Tool base class (safe defaults), concurrency partition, synthetic errors.
+try:
+    from tools.tool_base import (  # noqa: F401 — registers tools for capability queries
+        map_tool_result,
+        check_tool_permissions,
+        validate_tool_input,
+        get_concurrency_safe_tool_names,
+    )
+except ImportError:
+    map_tool_result = None
+    check_tool_permissions = None
+    validate_tool_input = None
+    get_concurrency_safe_tool_names = None
+
+try:
+    from tools.concurrency import (  # noqa: F401 — exports partition API
+        partition_tool_calls,
+        classify_tool,
+        is_read_only_tool,
+    )
+except ImportError:
+    partition_tool_calls = None
+    classify_tool = None
+    is_read_only_tool = None
+
 logger = logging.getLogger(__name__)
 
 # Tracks platform-bundle names already flagged in disabled_toolsets so the
@@ -1221,9 +1247,30 @@ def handle_function_call(
         return result
 
     except Exception as e:
-        error_msg = f"Error executing {function_name}: {str(e)}"
-        logger.exception(error_msg)
-        return json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
+        error_msg = str(e)
+        logger.exception("Error executing %s: %s", function_name, error_msg)
+
+        # ── Synthetic Error Result (Claude Code: StreamingToolExecutor.ts) ──
+        # Structured error format instead of raw exception dump.
+        # Categorize errors for better model understanding.
+        error_category = "system_error"
+        if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+            error_category = "timeout"
+        elif "permission" in error_msg.lower() or "denied" in error_msg.lower():
+            error_category = "permission_denied"
+        elif "connection" in error_msg.lower() or "network" in error_msg.lower():
+            error_category = "network_error"
+        elif "validation" in error_msg.lower() or "invalid" in error_msg.lower():
+            error_category = "validation_error"
+
+        synthetic = {
+            "error": f"{function_name} failed",
+            "detail": error_msg[:500],
+            "category": error_category,
+            "tool": function_name,
+            "is_error": True,
+        }
+        return json.dumps(synthetic, ensure_ascii=False)
 
 
 # =============================================================================
