@@ -8738,15 +8738,16 @@ def _discard_lockfile_churn(git_cmd, repo_root):
 
 
 def _post_update_merge_patches(git_cmd: list, project_root) -> None:
-    """Auto-merge local 'my-patches' branch after a successful update.
+    """Auto-merge local 'my-patches' into main after a successful update.
 
-    Runs at the end of ``_cmd_update_impl`` to prevent local patches from
-    being stranded on 'main'. Flow:
+    Flow (v2 — merge patches INTO main, not the reverse):
       1. Check if 'my-patches' branch exists locally.
-      2. If yes, switch to it and merge the freshly-pulled main.
-      3. On conflict, auto-resolve using 'ours' (patches take priority).
-      4. Reinstall the package from the patched branch.
-      5. Run the verification script if present.
+      2. Switch to main (already updated from upstream).
+      3. Merge my-patches into main.
+      4. On conflict, auto-resolve using '--theirs' (patches take priority
+         because my-patches is the "theirs" side in a merge into main).
+      5. Reinstall the package from main (now with patches applied).
+      6. Run the verification script if present.
     All failures are non-fatal — the core update already succeeded.
     """
     try:
@@ -8770,29 +8771,31 @@ def _post_update_merge_patches(git_cmd: list, project_root) -> None:
         print()
         print("── Post-update: merging local patches ──────────────────────")
 
-        # Switch to my-patches if not already on it
-        if current != "my-patches":
-            print("→ Switching to my-patches...")
+        # Switch to main (freshly updated from upstream)
+        if current != "main":
+            print("→ Switching to main...")
             subprocess.run(
-                git_cmd + ["checkout", "my-patches"],
+                git_cmd + ["checkout", "main"],
                 cwd=project_root,
                 capture_output=True,
                 text=True,
                 check=False,
             )
 
-        # Merge main into my-patches
-        print("→ Merging main into my-patches...")
+        # Merge my-patches INTO main (theirs = patches, ours = upstream main)
+        print("→ Merging my-patches into main...")
         merge = subprocess.run(
-            git_cmd + ["merge", "main", "-m",
-                       "Merge branch 'main' into my-patches (auto post-update)"],
+            git_cmd + ["merge", "my-patches", "-m",
+                       "Merge my-patches into main (auto post-update)"],
             cwd=project_root,
             capture_output=True,
             text=True,
         )
 
         if merge.returncode != 0:
-            # Conflicts — auto-resolve using ours (patches priority)
+            # Conflicts — auto-resolve using --theirs (patches priority)
+            # In "merge my-patches into main": 'ours' = main (upstream),
+            # 'theirs' = my-patches (our patches). We want patches to win.
             print("⚠️  Merge conflict — auto-resolving (patches priority)...")
             status = subprocess.run(
                 git_cmd + ["diff", "--name-only", "--diff-filter=U"],
@@ -8802,9 +8805,9 @@ def _post_update_merge_patches(git_cmd: list, project_root) -> None:
             )
             conflicted = status.stdout.strip().splitlines() if status.stdout.strip() else []
             for f in conflicted:
-                print(f"   keeping patches for: {f}")
+                print(f"   applying patches for: {f}")
                 subprocess.run(
-                    git_cmd + ["checkout", "--ours", f],
+                    git_cmd + ["checkout", "--theirs", f],
                     cwd=project_root,
                     capture_output=True,
                     text=True,
@@ -8819,16 +8822,16 @@ def _post_update_merge_patches(git_cmd: list, project_root) -> None:
                 )
             subprocess.run(
                 git_cmd + ["commit", "-m",
-                           "Merge main (auto-resolved conflicts — ours)"],
+                           "Merge my-patches (auto-resolved — patches win)"],
                 cwd=project_root,
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            print("✓ Conflicts resolved")
+            print("✓ Conflicts resolved (patches applied)")
 
-        # Reinstall from patched branch
-        print("→ Reinstalling from my-patches...")
+        # Reinstall from main (now has patches merged in)
+        print("→ Reinstalling from main (with patches)...")
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "--ignore-installed",
              "--no-deps", "-e", "."],
