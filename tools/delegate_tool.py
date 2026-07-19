@@ -737,6 +737,135 @@ def _build_child_system_prompt(
     return "\n".join(parts)
 
 
+
+
+# ── Git worktree isolation (opt-in via delegation.worktree_isolation) ──
+def _is_inside_worktree(cwd: str) -> bool:
+    """Return True if *cwd* is already inside a git worktree (recursive guard).
+
+    A worktree has a ``.git`` that is a *file* (not a directory) containing a
+    ``gitdir:`` pointer to ``<repo>/.git/worktrees/<name>``. The main repo's
+    ``.git`` is a directory. We detect the file form, and also fall back to the
+    ``/.git/worktrees/`` substring in the common-dir for older layouts.
+    """
+    import subprocess as _sp
+    try:
+        git_dir_file = os.path.join(cwd, ".git")
+        if os.path.isfile(git_dir_file):
+            # Worktree: .git is a file pointer, not the real .git directory.
+            return True
+        common = _sp.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, cwd=cwd, timeout=10,
+        )
+        git_dir = common.stdout.strip()
+        if "/.git/worktrees/" in git_dir:
+            return True
+        # Absolute common-dir equal to "<repo>/.git" but .git is a file → worktree.
+        return bool(git_dir) and git_dir.endswith("/.git") and os.path.isfile(git_dir_file)
+    except Exception:
+        return False
+
+
+def _create_worktree(parent_cwd: str, task_id: str) -> Optional[str]:
+    """Create a git worktree for subagent isolation.
+
+    The worktree is created at ``{worktree_dir}/{task_id}`` inside the parent
+    repo (default ``.hermes/worktrees/``). Returns the absolute path to the new
+    worktree, or ``None`` on any failure (isolation is best-effort — a child
+    always runs, just without isolation).
+
+    Recursive guard: if *parent_cwd* is itself inside a worktree, or is not a
+    git repo at all, returns ``None`` (children of worktrees don't nest).
+    """
+    import subprocess as _sp
+
+    cfg = _load_config()
+    if not cfg.get("worktree_isolation", False):
+        return None
+    if not parent_cwd or not os.path.isdir(parent_cwd):
+        return None
+
+    wt_dir = cfg.get("worktree_dir", ".hermes/worktrees/")
+    wt_base = os.path.abspath(os.path.expanduser(os.path.join(parent_cwd, wt_dir)))
+    wt_path = os.path.join(wt_base, task_id)
+
+    try:
+        # Parent must be a git repo.
+        top = _sp.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, cwd=parent_cwd, timeout=10,
+        )
+        if top.returncode != 0:
+            logger.debug("Worktree: parent cwd is not a git repo, skipping isolation")
+            return None
+        # Recursive guard — don't nest worktrees.
+        if _is_inside_worktree(parent_cwd):
+            logger.debug("Worktree: parent already inside a worktree, recursive guard — skipping")
+            return None
+        os.makedirs(wt_base, exist_ok=True)
+        result = _sp.run(
+            ["git", "worktree", "add", "--detach", wt_path, "HEAD"],
+            capture_output=True, text=True, cwd=parent_cwd, timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warning("Worktree creation failed: %s", result.stderr.strip())
+            return None
+        logger.info("Worktree created at %s", wt_path)
+        return wt_path
+    except Exception as exc:
+        logger.debug("Worktree creation error: %s", exc)
+        return None
+
+
+def _cleanup_worktree(wt_path: str) -> None:
+    """Remove a git worktree after the subagent finishes.
+
+    Safe cleanup: if the worktree has uncommitted changes it is KEPT for manual
+    review (the user's work is never silently destroyed). Otherwise it is
+    removed via ``git worktree remove --force``.
+    """
+    import subprocess as _sp
+
+    if not wt_path or not os.path.isdir(wt_path):
+        return
+    cfg = _load_config()
+    if not cfg.get("worktree_auto_cleanup", True):
+        logger.info("Worktree auto-cleanup disabled, keeping %s", wt_path)
+        return
+    try:
+        status = _sp.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, cwd=wt_path, timeout=10,
+        )
+        if status.stdout.strip():
+            logger.info("Worktree %s has uncommitted changes — keeping for review", wt_path)
+            return
+        # Resolve the main repo root from the worktree itself (robust to
+        # absolute vs relative git-common-dir values).
+        top = _sp.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, cwd=wt_path, timeout=10,
+        )
+        main_repo = top.stdout.strip() or None
+        # The worktree's toplevel is the repo root; run remove from there.
+        if main_repo and os.path.isdir(main_repo):
+            res = _sp.run(
+                ["git", "worktree", "remove", "--force", wt_path],
+                capture_output=True, text=True, cwd=main_repo, timeout=15,
+            )
+            if res.returncode == 0:
+                logger.info("Worktree cleaned up: %s", wt_path)
+            else:
+                logger.debug("Worktree remove failed: %s", res.stderr.strip())
+        else:
+            import shutil
+            shutil.rmtree(wt_path, ignore_errors=True)
+            logger.info("Worktree directory removed: %s", wt_path)
+    except Exception as exc:
+        logger.debug("Worktree cleanup error: %s", exc)
+
+
 def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     """Best-effort local workspace hint for child prompts.
 
@@ -1086,6 +1215,9 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Optional git worktree path; when set, overrides the child's workspace
+    # hint so the child operates on an isolated repo copy (isolation feature).
+    worktree_path: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1188,6 +1320,9 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
+    if worktree_path:
+        # Isolation override: child runs against the isolated worktree copy.
+        workspace_hint = worktree_path
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -2431,6 +2566,7 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    isolation: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2566,6 +2702,14 @@ def delegate_task(
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
+    # ── Worktree isolation (opt-in) ──
+    # Compute a shared worktree for ALL children in this delegation call when
+    # isolation="worktree" is requested and enabled in config. A single worktree
+    # per call keeps children mutually consistent; nested calls get their own.
+    _call_worktree: Optional[str] = None
+    if isolation == "worktree":
+        _base_hint = _resolve_workspace_hint(parent_agent) or os.getcwd()
+        _call_worktree = _create_worktree(_base_hint, f"del-{_uuid.uuid4().hex[:8]}")
     try:
         for i, t in enumerate(task_list):
             # Per-task role beats top-level; normalise again so unknown
@@ -2591,6 +2735,7 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                worktree_path=_call_worktree,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2598,6 +2743,13 @@ def delegate_task(
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
+
+        # Clean up the worktree created for this delegation call (if any).
+        if _call_worktree:
+            try:
+                _cleanup_worktree(_call_worktree)
+            except Exception as exc:
+                logger.debug("Worktree cleanup after delegation failed: %s", exc)
 
     def _execute_and_aggregate() -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -3586,4 +3738,7 @@ registry.register(
     check_fn=check_delegate_requirements,
     emoji="🔀",
     dynamic_schema_overrides=_build_dynamic_schema_overrides,
+    is_read_only=False,
+    is_destructive=False,
+    is_concurrency_safe=False,
 )
